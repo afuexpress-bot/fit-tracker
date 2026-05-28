@@ -265,6 +265,8 @@
     </div>
     <input type="password" class="settings-input" id="api-key-input" placeholder="sk-ant-...">
     <button class="settings-save" onclick="saveApiKey()">儲存 API Key</button>
+    <button onclick="testApi()" style="width:100%;padding:10px;background:transparent;border:1px solid var(--border);color:var(--text2);border-radius:10px;font-size:13px;cursor:pointer;font-family:inherit;margin-top:8px;">🧪 測試 API 連線</button>
+    <div id="api-test-result" style="font-size:12px;margin-top:8px;text-align:center;"></div>
   </div>
 </div>
 
@@ -311,31 +313,48 @@ function getApiKey() { return localStorage.getItem('anthropic_key')||''; }
 async function analyzeKcal(mealId, text) {
   const apiKey = getApiKey();
   const d = getDay(currentDate);
-  if (!text.trim()) {
+  if (!text.trim() || text.trim()==='無') {
     d.kcals[mealId]=0; d.proteins[mealId]=0; d.breakdowns[mealId]='';
     setDay(currentDate, d); renderKcal(mealId); updateSummary(); return;
   }
   if (!apiKey) {
-    showToast('請先設定 API Key ⚙');
-    renderKcalManual(mealId); return;
+    showToast('⚙ 請先設定 API Key');
+    const resEl=document.getElementById('res-'+mealId);
+    if(resEl) resEl.innerHTML=`<span style="font-size:12px;color:var(--red)">⚠ 未設定 API Key</span>`;
+    return;
   }
   analyzingSet.add(mealId); renderKcal(mealId);
   try {
     const res = await fetch('https://api.anthropic.com/v1/messages', {
       method:'POST',
-      headers:{ 'Content-Type':'application/json', 'x-api-key': apiKey, 'anthropic-version':'2023-06-01', 'anthropic-dangerous-direct-browser-access':'true' },
+      headers:{
+        'Content-Type':'application/json',
+        'x-api-key': apiKey,
+        'anthropic-version':'2023-06-01',
+        'anthropic-dangerous-direct-browser-access':'true'
+      },
       body: JSON.stringify({
-        model:'claude-sonnet-4-20250514', max_tokens:200,
-        system:`你是營養師。根據輸入的食物描述，估算熱量和蛋白質。只回傳JSON，格式：{"kcal":數字,"protein":數字,"breakdown":"每項食物熱量簡述"}。kcal和protein都是整數。breakdown中文，最多50字。不加markdown。`,
+        model:'claude-haiku-4-5-20251001',
+        max_tokens:300,
+        system:`你是營養師。根據食物描述估算熱量和蛋白質。只回傳JSON，格式：{"kcal":數字,"protein":數字,"breakdown":"簡述"}。數字為整數。不加markdown或其他文字。`,
         messages:[{role:'user',content:`食物：${text}`}]
       })
     });
+    if(!res.ok) {
+      const err = await res.json();
+      throw new Error(err?.error?.message || `HTTP ${res.status}`);
+    }
     const data = await res.json();
     const raw = data.content?.[0]?.text||'{}';
     const parsed = JSON.parse(raw.replace(/```json|```/g,'').trim());
     d.kcals[mealId]=parsed.kcal||0; d.proteins[mealId]=parsed.protein||0; d.breakdowns[mealId]=parsed.breakdown||'';
     setDay(currentDate, d);
-  } catch(e) { console.error(e); }
+  } catch(e) {
+    console.error('API Error:', e);
+    const resEl=document.getElementById('res-'+mealId);
+    if(resEl) resEl.innerHTML=`<span style="font-size:11px;color:var(--red)">⚠ ${e.message} <button onclick="analyzeKcal('${mealId}',document.getElementById('mt-${mealId}').value)" style="background:var(--card2);border:1px solid var(--border);color:var(--text);border-radius:4px;padding:2px 6px;cursor:pointer;font-size:11px;margin-left:4px;">重試</button></span>`;
+    analyzingSet.delete(mealId); return;
+  }
   analyzingSet.delete(mealId); renderKcal(mealId); updateSummary();
 }
 
@@ -376,14 +395,23 @@ function renderMeals() {
         <span class="meal-time">${m.time}</span>
       </div>
       <textarea class="meal-textarea" id="mt-${m.id}" rows="2" placeholder="${m.ph}" oninput="onMealInput('${m.id}')">${d.meals[m.id]||''}</textarea>
-      <div class="meal-result" id="res-${m.id}">
-        <span style="font-size:12px;color:var(--text3)">輸入食物後自動計算</span>
+      <div style="display:flex;align-items:center;gap:8px;margin-top:7px;">
+        <div class="meal-result" id="res-${m.id}" style="flex:1;margin-top:0;">
+          <span style="font-size:12px;color:var(--text3)">輸入食物後自動計算</span>
+        </div>
+        <button onclick="manualCalc('${m.id}')" style="background:var(--card2);border:1px solid var(--border);color:var(--text2);border-radius:8px;padding:5px 10px;cursor:pointer;font-size:12px;white-space:nowrap;flex-shrink:0;">🔄 計算</button>
       </div>
       <div class="meal-breakdown" id="bd-${m.id}"></div>
     `;
     list.appendChild(div);
     renderKcal(m.id);
   });
+}
+
+function manualCalc(mealId) {
+  const val = document.getElementById('mt-'+mealId)?.value||'';
+  if(!val.trim()) { showToast('請先輸入食物內容'); return; }
+  analyzeKcal(mealId, val);
 }
 
 function onMealInput(mealId) {
@@ -599,6 +627,183 @@ function render() {
   const wEl=document.getElementById('weight');
   if(wEl) wEl.value=d.weight||'';
   renderMeals(); renderWater(); renderWeightDiff(); updateSummary();
+}
+
+// ─── Food Search ──────────────────────────────────────────
+let foodSearchTimer = null;
+let selectedFood = null;
+
+function searchFood(query) {
+  clearTimeout(foodSearchTimer);
+  const resultsEl = document.getElementById('food-search-results');
+  const detailEl = document.getElementById('food-detail');
+  if (!query.trim() || query.length < 1) {
+    resultsEl.innerHTML = '';
+    detailEl.style.display = 'none';
+    return;
+  }
+  foodSearchTimer = setTimeout(() => {
+    if (typeof FOOD_DB === 'undefined') {
+      resultsEl.innerHTML = '<div style="font-size:12px;color:var(--text3);padding:8px">載入食物資料庫中...</div>';
+      loadFoodDB(() => searchFood(query));
+      return;
+    }
+    const q = query.toLowerCase().trim();
+    const results = FOOD_DB.filter(f =>
+      f.n.toLowerCase().includes(q) ||
+      (f.a && f.a.toLowerCase().includes(q))
+    ).slice(0, 12);
+
+    if (!results.length) {
+      resultsEl.innerHTML = '<div style="font-size:12px;color:var(--text3);padding:8px">找不到相關食物</div>';
+      return;
+    }
+    resultsEl.innerHTML = results.map((f, i) => `
+      <div onclick="showFoodDetail(${i}, '${query}')" style="padding:9px 10px;border-bottom:1px solid var(--border);cursor:pointer;border-radius:6px;margin-bottom:2px;"
+        onmouseover="this.style.background='var(--card2)'" onmouseout="this.style.background='transparent'">
+        <div style="font-size:14px;font-weight:600;">${f.n}</div>
+        <div style="font-size:11px;color:var(--text3);margin-top:2px;">${f.c}${f.a ? ' · ' + f.a : ''}</div>
+        <div style="font-size:12px;color:var(--accent);margin-top:2px;">
+          ${f.k ? f.k + ' kcal' : '—'} ／ 蛋白質 ${f.p || '—'}g ／ 碳水 ${f.ch || '—'}g
+        </div>
+      </div>
+    `).join('');
+    // Store filtered results for detail view
+    window._searchResults = results;
+    detailEl.style.display = 'none';
+  }, 300);
+}
+
+function showFoodDetail(idx, query) {
+  const f = window._searchResults[idx];
+  if (!f) return;
+  selectedFood = f;
+  const detailEl = document.getElementById('food-detail');
+  const resultsEl = document.getElementById('food-search-results');
+  resultsEl.innerHTML = '';
+
+  detailEl.style.display = 'block';
+  detailEl.innerHTML = `
+    <div style="background:var(--card2);border-radius:10px;padding:14px;">
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:10px;">
+        <div>
+          <div style="font-size:16px;font-weight:800;">${f.n}</div>
+          <div style="font-size:11px;color:var(--text3);margin-top:2px;">${f.c}${f.a ? ' · ' + f.a : ''}</div>
+        </div>
+        <button onclick="clearFoodSearch()" style="background:transparent;border:none;color:var(--text3);font-size:18px;cursor:pointer;">✕</button>
+      </div>
+
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:12px;">
+        ${[
+          ['熱量', f.k, 'kcal', 'var(--accent)'],
+          ['蛋白質', f.p, 'g', 'var(--green)'],
+          ['脂肪', f.f, 'g', 'var(--orange)'],
+          ['碳水', f.ch, 'g', 'var(--blue)'],
+          ['膳食纖維', f.fi, 'g', 'var(--text2)'],
+        ].map(([label, val, unit, color]) => `
+          <div style="background:var(--card);border-radius:8px;padding:8px;text-align:center;border:1px solid var(--border);">
+            <div style="font-size:16px;font-weight:700;color:${color}">${val != null ? val : '—'}${val != null ? unit : ''}</div>
+            <div style="font-size:10px;color:var(--text3);margin-top:2px;">${label}</div>
+          </div>
+        `).join('')}
+        <div style="background:var(--card);border-radius:8px;padding:8px;text-align:center;border:1px solid var(--border);">
+          <div style="font-size:11px;color:var(--text3);">以上為每</div>
+          <div style="font-size:14px;font-weight:700;color:var(--text);">100g</div>
+          <div style="font-size:11px;color:var(--text3);">的含量</div>
+        </div>
+      </div>
+
+      <div style="margin-bottom:12px;">
+        <div style="font-size:12px;color:var(--text3);margin-bottom:6px;">自訂食用量計算</div>
+        <div style="display:flex;align-items:center;gap:8px;">
+          <input type="number" id="custom-amount" value="100" min="1" max="2000"
+            style="width:80px;background:var(--card);border:1px solid var(--border);border-radius:8px;padding:7px;font-size:14px;color:var(--text);text-align:right;font-family:inherit;"
+            oninput="updateCustomCalc()">
+          <span style="font-size:13px;color:var(--text2)">g</span>
+          <div id="custom-calc" style="flex:1;font-size:13px;color:var(--text2);"></div>
+        </div>
+      </div>
+
+      <button onclick="addFoodToMeal()" style="width:100%;padding:10px;background:var(--accent);color:#000;border:none;border-radius:8px;font-size:13px;font-weight:700;cursor:pointer;font-family:inherit;">
+        ＋ 加入今日飲食記錄
+      </button>
+    </div>
+  `;
+  updateCustomCalc();
+}
+
+function updateCustomCalc() {
+  const f = selectedFood;
+  if (!f) return;
+  const amt = parseFloat(document.getElementById('custom-amount')?.value) || 100;
+  const ratio = amt / 100;
+  const k = f.k ? (f.k * ratio).toFixed(1) : '—';
+  const p = f.p ? (f.p * ratio).toFixed(1) : '—';
+  const ch = f.ch ? (f.ch * ratio).toFixed(1) : '—';
+  const fat = f.f ? (f.f * ratio).toFixed(1) : '—';
+  document.getElementById('custom-calc').innerHTML =
+    `<span style="color:var(--accent);font-weight:700">${k} kcal</span>｜蛋白 <span style="color:var(--green)">${p}g</span>｜碳水 ${ch}g｜脂肪 ${fat}g`;
+}
+
+function addFoodToMeal() {
+  const f = selectedFood;
+  if (!f) return;
+  const amt = parseFloat(document.getElementById('custom-amount')?.value) || 100;
+  // Find current active meal tab or default to lunch
+  const mealOrder = ['breakfast','lunch','snack','dinner','supper'];
+  let targetMeal = 'lunch';
+  const h = new Date().getHours();
+  if (h < 10) targetMeal = 'breakfast';
+  else if (h < 14) targetMeal = 'lunch';
+  else if (h < 17) targetMeal = 'snack';
+  else if (h < 21) targetMeal = 'dinner';
+  else targetMeal = 'supper';
+
+  const mealEl = document.getElementById('mt-' + targetMeal);
+  if (mealEl) {
+    const existing = mealEl.value.trim();
+    const newText = `${f.n} ${amt}g`;
+    mealEl.value = existing ? existing + '、' + newText : newText;
+    onMealInput(targetMeal);
+    showToast(`✅ 已加入${['早','午','點','晚','宵'][mealOrder.indexOf(targetMeal)]}餐`);
+    clearFoodSearch();
+    // Scroll to meals
+    document.getElementById('meals-list').scrollIntoView({behavior:'smooth'});
+  }
+}
+
+function clearFoodSearch() {
+  document.getElementById('food-search-input').value = '';
+  document.getElementById('food-search-results').innerHTML = '';
+  document.getElementById('food-detail').style.display = 'none';
+  selectedFood = null;
+}
+
+function loadFoodDB(callback) {
+  const script = document.createElement('script');
+  script.src = 'fooddb.js';
+  script.onload = callback;
+  document.head.appendChild(script);
+}
+
+// Preload food DB
+setTimeout(() => loadFoodDB(() => {}), 1000);
+
+async function testApi() {
+  const key = document.getElementById('api-key-input').value.trim() || getApiKey();
+  const el = document.getElementById('api-test-result');
+  if (!key) { el.innerHTML='<span style="color:var(--red)">請先輸入 API Key</span>'; return; }
+  el.innerHTML='<span style="color:var(--text3)">測試中...</span>';
+  try {
+    const res = await fetch('https://api.anthropic.com/v1/messages', {
+      method:'POST',
+      headers:{ 'Content-Type':'application/json', 'x-api-key':key, 'anthropic-version':'2023-06-01', 'anthropic-dangerous-direct-browser-access':'true' },
+      body: JSON.stringify({ model:'claude-haiku-4-5-20251001', max_tokens:10, messages:[{role:'user',content:'hi'}] })
+    });
+    const data = await res.json();
+    if(data.content) { el.innerHTML='<span style="color:var(--green)">✅ 連線成功！</span>'; }
+    else { el.innerHTML=`<span style="color:var(--red)">❌ ${data?.error?.message||'連線失敗'}</span>`; }
+  } catch(e) { el.innerHTML=`<span style="color:var(--red)">❌ ${e.message}</span>`; }
 }
 
 render();
